@@ -137,6 +137,23 @@ static inline void drawRect(s32 x, s32 y, s32 w, s32 h, Color color) {
     }
 }
 
+// 实心矩形（不混合，直接覆盖）
+static inline void drawRectSolid(s32 x, s32 y, s32 w, s32 h, Color color) {
+    s32 x2 = x + w;
+    s32 y2 = y + h;
+    if (x2 < 0 || y2 < 0) return;
+    if (x >= (s32)CFG_FramebufferWidth || y >= (s32)CFG_FramebufferHeight) return;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x2 > (s32)CFG_FramebufferWidth) x2 = CFG_FramebufferWidth;
+    if (y2 > (s32)CFG_FramebufferHeight) y2 = CFG_FramebufferHeight;
+    for (s32 xi = x; xi < x2; ++xi) {
+        for (s32 yi = y; yi < y2; ++yi) {
+            setPixel(xi, yi, color);
+        }
+    }
+}
+
 static inline void fillScreenSolid(Color color) {
     if (!g_currentFramebuffer) return;
     for (s32 xi = 0; xi < (s32)CFG_FramebufferWidth; ++xi) {
@@ -161,15 +178,15 @@ static inline void endFrame(void) {
     g_currentFramebuffer = NULL;
 }
 
-// 图形初始化与释放（移植 tesla Renderer::init/exit 的核心）
+// 图形初始化与释放（仿照 pop-windows-main 的防御式策略）
 static Result gfx_init(void) {
-    // 计算 Layer 尺寸，保持纵向填满屏幕并水平居中
-    CFG_LayerHeight = SCREEN_HEIGHT;
+    // 计算 Layer 尺寸，继续缩小高度以形成更小的"弹窗"效果并水平居中
+    CFG_LayerHeight = (u16)(SCREEN_HEIGHT * 0.35f);
     CFG_LayerWidth  = (u16)(SCREEN_HEIGHT * ((float)CFG_FramebufferWidth / (float)CFG_FramebufferHeight));
     CFG_LayerPosX = (u16)((SCREEN_WIDTH - CFG_LayerWidth) / 2);
     CFG_LayerPosY = (u16)((SCREEN_HEIGHT - CFG_LayerHeight) / 2); // 等于 0
 
-    log_info("viInitialize(ViServiceType_Manager)...");
+    log_info("viInitialize(ViServiceType_Manager)");
     Result rc = viInitialize(ViServiceType_Manager);
     if (R_FAILED(rc)) return rc;
 
@@ -197,23 +214,17 @@ static Result gfx_init(void) {
     rc = viSetLayerScalingMode(&g_layer, ViScalingMode_FitToLayer);
     if (R_FAILED(rc)) return rc;
 
-    s32 targetZ = 250;
-    log_info("viSetLayerZ(%d)...", targetZ);
-    rc = viSetLayerZ(&g_layer, targetZ);
+    s32 layerZ = 250;
+        log_info("viSetLayerZ(%d)...", layerZ);
+        rc = viSetLayerZ(&g_layer, layerZ);
         if (R_FAILED(rc)) return rc;
 
-    // 按 tesla.hpp 将 Layer 加入多个层栈（至少 Default）
-    log_info("viAddToLayerStack(Default/Lcd/others)...");
+    // 添加到图层栈（保守策略：仅 Default 和 Screenshot，避免冲突）
+    log_info("viAddToLayerStack(Default and Screenshot)...");
     rc = viAddToLayerStack(&g_layer, ViLayerStack_Default);
     if (R_FAILED(rc)) return rc;
-    // 可选：截图/录制/任意/最后一帧/空/LCD/调试
-    viAddToLayerStack(&g_layer, ViLayerStack_Screenshot);
-    viAddToLayerStack(&g_layer, ViLayerStack_Recording);
-    viAddToLayerStack(&g_layer, ViLayerStack_Arbitrary);
-    viAddToLayerStack(&g_layer, ViLayerStack_LastFrame);
-    viAddToLayerStack(&g_layer, ViLayerStack_Null);
-    viAddToLayerStack(&g_layer, ViLayerStack_ApplicationForDebug);
-    viAddToLayerStack(&g_layer, ViLayerStack_Lcd);
+    rc = viAddToLayerStack(&g_layer, ViLayerStack_Screenshot);
+    if (R_FAILED(rc)) return rc;
 
     log_info("viSetLayerSize(%u,%u)...", CFG_LayerWidth, CFG_LayerHeight);
     rc = viSetLayerSize(&g_layer, CFG_LayerWidth, CFG_LayerHeight);
@@ -235,17 +246,42 @@ static Result gfx_init(void) {
     return 0;
 }
 
-static __attribute__((unused)) void gfx_exit(void) {
+static void gfx_exit(void) {
     if (!g_gfxInitialized) return;
+    
+    log_info("开始清理图形资源...");
+    
+    // 清理图形相关资源
     framebufferClose(&g_framebuffer);
     nwindowClose(&g_window);
-    // 彻底销毁 Managed Layer，避免残留占用
-    log_info("viDestroyManagedLayer...");
-    viDestroyManagedLayer(&g_layer);
-    viCloseDisplay(&g_display);
+    
+    // 安全清理VI资源，避免与其他 overlay 退出冲突（仿照 pop-windows-main）
+    log_info("安全清理VI资源...");
+    
+    Result rc = 0;
+    
+    // 尝试销毁Managed Layer（容错处理）
+    rc = viDestroyManagedLayer(&g_layer);
+    if (R_FAILED(rc)) {
+        log_info("viDestroyManagedLayer失败 (可能已被其他程序清理): 0x%x", rc);
+    }
+    
+    // 尝试关闭Display（容错处理）
+    rc = viCloseDisplay(&g_display);
+    if (R_FAILED(rc)) {
+        log_info("viCloseDisplay失败 (可能已被其他程序清理): 0x%x", rc);
+    }
+    
     eventClose(&g_vsyncEvent);
+    
+    // 最后尝试退出VI服务
+    // 如果其他程序（如其他 overlay）已经调用了viExit()，
+    // 这里的调用可能会失败，但不会导致程序崩溃
     viExit();
+    
     g_gfxInitialized = false;
+    
+    log_info("图形资源清理完成");
 }
 
 
@@ -268,30 +304,42 @@ void __libnx_initheap(void)
     fake_heap_end = inner_heap + sizeof(inner_heap);
 }
 
-// 必要服务初始化（最小化）
+// 必要服务初始化（仿照 pop-windows-main 的严格错误处理）
 void __appInit(void)
 {
-    // 参考 libnx 默认初始化，确保时间与 SD 卡挂载可用
-    Result rc = smInitialize();
-    if (R_FAILED(rc)) return;
-
-    // AppletType_None 时 appletInitialize 返回 0，作为类型选择器
-    appletInitialize();
-    timeInitialize();
-    fsInitialize();
-    fsdevMountSdmc();
-    // HID 在 None 类型下不是必须，按需初始化
-    hidInitialize();
-
-    // 初始化设置服务（用于读取系统语言）
-    Result src = setInitialize();
-    if (R_FAILED(src)) {
-        log_error("setInitialize 失败: 0x%x", src);
+    log_info("应用程序初始化开始...");
+    
+    Result rc = 0;
+    
+    // 基础服务初始化（严格错误检查）
+    rc = smInitialize();
+    if (R_FAILED(rc)) {
+        log_error("smInitialize失败: 0x%x", rc);
+        fatalThrow(rc);
     }
-
-    // 字体服务初始化已移除（不再使用 plInitialize）
-
-    // NV 初始化提前到 appinit，避免在 gfx_init 阶段卡住，并输出详细日志
+    
+    rc = fsInitialize();
+    if (R_FAILED(rc)) {
+        log_error("fsInitialize失败: 0x%x", rc);
+        fatalThrow(rc);
+    }
+    
+    fsdevMountSdmc();
+    
+    // 其他服务初始化
+    rc = hidInitialize();
+    if (R_FAILED(rc)) {
+        log_error("hidInitialize失败: 0x%x", rc);
+        fatalThrow(rc);
+    }
+    
+    rc = setInitialize();
+    if (R_FAILED(rc)) {
+        log_error("setInitialize失败: 0x%x", rc);
+        fatalThrow(rc);
+    }
+    
+    // NV 初始化（不使用 fatalThrow，因为某些环境可能不需要）
     AppletType appType = appletGetAppletType();
     log_info("appletGetAppletType=%d", (int)appType);
     log_info("nvInitialize... (force type=%d, tmem=0x%x)", __nx_nv_service_type, __nx_nv_transfermem_size);
@@ -315,16 +363,22 @@ void __appInit(void)
     } else {
         log_info("nvFenceInit 成功");
     }
+    
+    log_info("应用程序初始化完成");
 }
 
-// 服务释放
+// 服务释放（仿照 pop-windows-main 的清理顺序）
 void __appExit(void)
 {
-    hidExit();
-    fsExit();
-    // 设置服务退出
+    log_info("应用程序退出开始...");
+    
+    // 优先清理图形资源，避免与其他叠加层冲突
+    gfx_exit();
+    
+    // 清理其他服务
     setExit();
-    // 字体服务退出已移除
+    hidExit();
+    
     // NV 相关清理
     log_info("nvFenceExit...");
     nvFenceExit();
@@ -332,7 +386,13 @@ void __appExit(void)
     nvMapExit();
     log_info("nvExit...");
     nvExit();
+    
+    // 最后清理基础服务
+    fsdevUnmountAll();
+    fsExit();
     smExit();
+    
+    log_info("应用程序退出完成");
 }
 
 #ifdef __cplusplus
@@ -344,7 +404,8 @@ void __appExit(void)
 #define GLYPH_W 16
 #define GLYPH_H 15
 
-static void draw_glyph_bitmap(s32 left, s32 top, s32 scale, const unsigned char *bits, int width, int height, Color color) {
+// 字形位图绘制（支持独立横纵缩放）
+static void draw_glyph_bitmap_scaled(s32 left, s32 top, s32 scale_x, s32 scale_y, const unsigned char *bits, int width, int height, Color color) {
     if (!g_currentFramebuffer) return;
     for (int row = 0; row < height; ++row) {
         unsigned char b0 = bits[row*2 + 0];
@@ -353,10 +414,15 @@ static void draw_glyph_bitmap(s32 left, s32 top, s32 scale, const unsigned char 
         for (int col = 0; col < width; ++col) {
             unsigned short mask = (unsigned short)1 << (15 - col);
             if (rowBits & mask) {
-                drawRect(left + col*scale, top + row*scale, scale, scale, color);
+                drawRect(left + col*scale_x, top + row*scale_y, scale_x, scale_y, color);
             }
         }
     }
+}
+
+// 等比例缩放（兼容旧调用）
+static void draw_glyph_bitmap(s32 left, s32 top, s32 scale, const unsigned char *bits, int width, int height, Color color) {
+    draw_glyph_bitmap_scaled(left, top, scale, scale, bits, width, height, color);
 }
 
 // UTF-8 简易解码（仅支持到 U+10FFFF）
@@ -597,53 +663,63 @@ static const unsigned char glyph_bai_bits[] = {
     0x82, 0x00,
 };
 
-// 将指定 codepoint 映射到已知字形并绘制；返回是否成功
-static bool draw_known_glyph(u32 cp, s32 left, s32 top, s32 scale, Color color) {
+// 将指定 codepoint 映射到已知字形并绘制（支持独立横纵缩放）
+static bool draw_known_glyph_scaled(u32 cp, s32 left, s32 top, s32 scale_x, s32 scale_y, Color color) {
     switch (cp) {
         case 0x6B63: // 正
-            draw_glyph_bitmap(left, top, scale, glyph_zheng_bits, GLYPH_W, GLYPH_H, color); return true;
+            draw_glyph_bitmap_scaled(left, top, scale_x, scale_y, glyph_zheng_bits, GLYPH_W, GLYPH_H, color); return true;
         case 0x5728: // 在
-            draw_glyph_bitmap(left, top, scale, glyph_zai_bits, GLYPH_W, GLYPH_H, color); return true;
+            draw_glyph_bitmap_scaled(left, top, scale_x, scale_y, glyph_zai_bits, GLYPH_W, GLYPH_H, color); return true;
         case 0x5907: // 备
-            draw_glyph_bitmap(left, top, scale, glyph_bei_bits, GLYPH_W, GLYPH_H, color); return true;
+            draw_glyph_bitmap_scaled(left, top, scale_x, scale_y, glyph_bei_bits, GLYPH_W, GLYPH_H, color); return true;
         case 0x4EFD: // 份
-            draw_glyph_bitmap(left, top, scale, glyph_fen_bits, GLYPH_W, GLYPH_H, color); return true;
+            draw_glyph_bitmap_scaled(left, top, scale_x, scale_y, glyph_fen_bits, GLYPH_W, GLYPH_H, color); return true;
         case 0x4E0A: // 上
-            draw_glyph_bitmap(left, top, scale, glyph_shang_bits, GLYPH_W, GLYPH_H, color); return true;
+            draw_glyph_bitmap_scaled(left, top, scale_x, scale_y, glyph_shang_bits, GLYPH_W, GLYPH_H, color); return true;
         case 0x4F20: // 传
-            draw_glyph_bitmap(left, top, scale, glyph_chuan_bits, GLYPH_W, GLYPH_H, color); return true;
+            draw_glyph_bitmap_scaled(left, top, scale_x, scale_y, glyph_chuan_bits, GLYPH_W, GLYPH_H, color); return true;
         case 0x6210: // 成
-            draw_glyph_bitmap(left, top, scale, glyph_cheng_bits, GLYPH_W, GLYPH_H, color); return true;
+            draw_glyph_bitmap_scaled(left, top, scale_x, scale_y, glyph_cheng_bits, GLYPH_W, GLYPH_H, color); return true;
         case 0x529F: // 功
-            draw_glyph_bitmap(left, top, scale, glyph_gong_bits, GLYPH_W, GLYPH_H, color); return true;
+            draw_glyph_bitmap_scaled(left, top, scale_x, scale_y, glyph_gong_bits, GLYPH_W, GLYPH_H, color); return true;
         case 0x5931: // 失
-            draw_glyph_bitmap(left, top, scale, glyph_shi_bits, GLYPH_W, GLYPH_H, color); return true;
+            draw_glyph_bitmap_scaled(left, top, scale_x, scale_y, glyph_shi_bits, GLYPH_W, GLYPH_H, color); return true;
         case 0x8D25: // 败
-            draw_glyph_bitmap(left, top, scale, glyph_bai_bits, GLYPH_W, GLYPH_H, color); return true;
+            draw_glyph_bitmap_scaled(left, top, scale_x, scale_y, glyph_bai_bits, GLYPH_W, GLYPH_H, color); return true;
         default:
             return false;
     }
 }
 
-// 使用位图字形绘制 UTF-8 字符串（未知字符将跳过）
-static void draw_text_bitmap(const char *text, s32 left, s32 top, s32 scale, Color color, s32 letter_spacing) {
+// 等比例缩放（兼容旧调用）
+static bool draw_known_glyph(u32 cp, s32 left, s32 top, s32 scale, Color color) {
+    return draw_known_glyph_scaled(cp, left, top, scale, scale, color);
+}
+
+// 使用位图字形绘制 UTF-8 字符串（支持独立横纵缩放）
+static void draw_text_bitmap_scaled(const char *text, s32 left, s32 top, s32 scale_x, s32 scale_y, Color color, s32 letter_spacing) {
     if (!text || !g_currentFramebuffer) return;
     s32 x = left;
     const char *p = text;
     while (*p) {
         u32 cp = 0; p = utf8_next_simple(p, &cp);
         if (cp == 0) break;
-        if (draw_known_glyph(cp, x, top, scale, color)) {
-            x += (GLYPH_W + letter_spacing) * scale;
+        if (draw_known_glyph_scaled(cp, x, top, scale_x, scale_y, color)) {
+            x += (GLYPH_W + letter_spacing) * scale_x;
         } else {
             // 未知字符：空格宽度处理
-            x += (GLYPH_W + letter_spacing) * scale;
+            x += (GLYPH_W + letter_spacing) * scale_x;
         }
     }
 }
 
+// 等比例缩放（兼容旧调用）
+static void draw_text_bitmap(const char *text, s32 left, s32 top, s32 scale, Color color, s32 letter_spacing) {
+    draw_text_bitmap_scaled(text, left, top, scale, scale, color, letter_spacing);
+}
+
 // 计算位图字符串的像素宽度（按照每字 GLYPH_W 与字间距）
-static s32 text_bitmap_width(const char *text, s32 scale, s32 letter_spacing) {
+static __attribute__((unused)) s32 text_bitmap_width(const char *text, s32 scale, s32 letter_spacing) {
     if (!text) return 0;
     s32 count = 0;
     const char *p = text;
@@ -659,11 +735,14 @@ static s32 text_bitmap_width(const char *text, s32 scale, s32 letter_spacing) {
     return count * GLYPH_W * scale + (count - 1) * letter_spacing * scale;
 }
 
-// 粗体黑字 + 白色描边渲染
-static void draw_text_bold_outline(const char *text, s32 left, s32 top, s32 scale, s32 letter_spacing) {
+// 粗体文字渲染（使用砖块颜色，带白色描边，支持独立横纵缩放）
+static void draw_text_bold_outline_scaled(const char *text, s32 left, s32 top, s32 scale_x, s32 scale_y, s32 letter_spacing) {
     if (!text || !g_currentFramebuffer) return;
     Color outline = (Color){15, 15, 15, 15}; // 白色描边
-    Color fill    = (Color){0, 0, 0, 15};    // 黑色填充
+    // 使用砖块颜色（从 SCN_GROUND 的棕色系 0xE2C2，手动转换为 RGBA4444）
+    // RGB565: 0xE2C2 = R:28(11100), G:17(010001), B:2(00010)
+    // 转 RGBA4444: R≈14, G≈8, B≈1
+    Color fill = {14, 8, 1, 15};
 
     // 白色描边：在周围1像素位置绘制（帧缓冲像素单位）
     static const s32 off[8][2] = {
@@ -671,12 +750,20 @@ static void draw_text_bold_outline(const char *text, s32 left, s32 top, s32 scal
         {-1, -1}, {-1, 1}, {1, -1}, {1, 1}
     };
     for (int i = 0; i < 8; ++i) {
-        draw_text_bitmap(text, left + off[i][0], top + off[i][1], scale, outline, letter_spacing);
+        draw_text_bitmap_scaled(text, left + off[i][0], top + off[i][1], scale_x, scale_y, outline, letter_spacing);
     }
 
-    // 黑色填充：两次轻微偏移模拟加粗
-    draw_text_bitmap(text, left, top, scale, fill, letter_spacing);
-    draw_text_bitmap(text, left + 1, top, scale, fill, letter_spacing);
+    // 砖块色填充：多次偏移模拟加粗（4倍加粗效果）
+    for (s32 dy = 0; dy < 4; dy++) {
+        for (s32 dx = 0; dx < 4; dx++) {
+            draw_text_bitmap_scaled(text, left + dx, top + dy, scale_x, scale_y, fill, letter_spacing);
+        }
+    }
+}
+
+// 等比例缩放（兼容旧调用）
+static __attribute__((unused)) void draw_text_bold_outline(const char *text, s32 left, s32 top, s32 scale, s32 letter_spacing) {
+    draw_text_bold_outline_scaled(text, left, top, scale, scale, letter_spacing);
 }
 
 // 马里奥点阵图（基于 mariobros-clock-main 的专业实现）
@@ -689,7 +776,7 @@ static void draw_text_bold_outline(const char *text, s32 left, s32 top, s32 scal
 #define M_RED    0xF801  // 红色（帽子、衣服）
 #define M_SKIN   0xFD28  // 肤色
 #define M_SHOES  0xC300  // 鞋子（深红/棕色）
-#define M_SHIRT  0x7BCF  // 衬衫（蓝色）
+#define M_SHIRT  0xFFFF  // 衬衫（白色）
 #define M_HAIR   0x0000  // 头发（黑色）
 #define M_MASK   0x000E  // 透明色（天空色，不绘制）
 
@@ -747,21 +834,163 @@ static const u16 MARIO_JUMP[] = {
 #define MARIO_JUMP_W 17
 #define MARIO_JUMP_H 16
 
-// 绘制 RGB565 点阵图（支持透明色）
-static void draw_rgb565_bitmap(s32 x, s32 y, const u16 *bitmap, s32 width, s32 height, s32 scale) {
+// 绘制 RGB565 点阵图（支持透明色，支持独立横纵缩放）
+static void draw_rgb565_bitmap_scaled(s32 x, s32 y, const u16 *bitmap, s32 width, s32 height, s32 scale_x, s32 scale_y) {
     if (!g_currentFramebuffer || !bitmap) return;
     
     for (s32 row = 0; row < height; row++) {
         for (s32 col = 0; col < width; col++) {
             u16 pixel = bitmap[row * width + col];
-            // 跳过透明色
+            // 跳过透明色（与 mariobros-clock-main 的 _MASK 一致）
             if (pixel == M_MASK) continue;
             
             Color color = rgb565_to_color(pixel);
-            // 绘制放大的像素块
-            drawRect(x + col * scale, y + row * scale, scale, scale, color);
+            // 使用实心绘制，避免半透明混合导致的失真/边缘发灰
+            drawRectSolid(x + col * scale_x, y + row * scale_y, scale_x, scale_y, color);
         }
     }
+}
+
+// 绘制 RGB565 点阵图（等比例缩放，兼容旧调用）
+static void draw_rgb565_bitmap(s32 x, s32 y, const u16 *bitmap, s32 width, s32 height, s32 scale) {
+    draw_rgb565_bitmap_scaled(x, y, bitmap, width, height, scale, scale);
+}
+
+// 复用 mariobros-clock-main 的场景素材（重命名为 SCN_* 以避免命名冲突）
+// CLOUD1 从 mariobros-clock-main 精确复制（13列×12行=156，行主序）
+static const u16 SCN_CLOUD1[156] = {
+    0x000E, 0x0000, 0x0000, 0x0000, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E,
+    0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000, 0x0000, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E,
+    0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000, 0x000E, 0x0000, 0x000E, 0x000E, 0x000E, 0x000E,
+    0xFFFF, 0x3DFF, 0xFFFF, 0xFFFF, 0x3DFF, 0xFFFF, 0xFFFF, 0x0000, 0xFFFF, 0x0000, 0x000E, 0x000E, 0x000E,
+    0x3DFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000, 0x000E, 0x000E,
+    0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000, 0x000E,
+    0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000, 0x000E,
+    0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000, 0x000E, 0x000E,
+    0xFFFF, 0xFFFF, 0xFFFF, 0x3DFF, 0x3DFF, 0xFFFF, 0x3DFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000, 0x000E,
+    0x3DFF, 0x3DFF, 0x3DFF, 0xFFFF, 0xFFFF, 0x3DFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000, 0x000E, 0x000E,
+    0xFFFF, 0xFFFF, 0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000, 0x0000, 0x0000, 0x000E, 0x000E, 0x000E, 0x000E,
+    0x0000, 0x0000, 0x000E, 0x0000, 0x0000, 0x0000, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E
+};
+
+// CLOUD2 从 mariobros-clock-main 精确复制（13列×12行=156，行主序）
+static const u16 SCN_CLOUD2[156] = {
+    0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x0000, 0x0000, 0x0000, 0x000E, 0x000E, 0x000E,
+    0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000, 0x0000, 0x000E,
+    0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000,
+    0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x0000, 0xFFFF, 0x3DFF, 0xFFFF, 0xFFFF, 0x3DFF, 0xFFFF, 0xFFFF,
+    0x000E, 0x000E, 0x000E, 0x0000, 0x0000, 0xFFFF, 0x3DFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+    0x000E, 0x000E, 0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+    0x000E, 0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+    0x000E, 0xFFFF, 0xFFFF, 0xFFFF, 0x3DFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+    0x000E, 0x000E, 0x0000, 0xFFFF, 0xFFFF, 0x3DFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x3DFF, 0x3DFF, 0xFFFF, 0x3DFF,
+    0x000E, 0x000E, 0x000E, 0x0000, 0xFFFF, 0xFFFF, 0x3DFF, 0x3DFF, 0x3DFF, 0xFFFF, 0xFFFF, 0x3DFF, 0xFFFF,
+    0x000E, 0x000E, 0x000E, 0x000E, 0x0000, 0x0000, 0xFFFF, 0xFFFF, 0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0x0000,
+    0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x0000, 0x0000, 0x000E, 0x0000, 0x0000, 0x0000, 0x000E
+};
+
+static const u16 SCN_BUSH[189] = {
+    0x000E,0x000E,0x000E,0x000E,0x000E,0x000E,0x000E,0x000E,0x0000,0x0000,0x000E,0x000E,0x000E,0x000E,0x000E,0x000E,
+    0x000E,0x0000,0x0000,0x000E,0x000E,0x000E,0x000E,0x000E,0x000E,0x000E,0x000E,0x000E,0x0000,0xBFE3,0xBFE3,0x0000,
+    0x000E,0x0000,0x000E,0x000E,0x000E,0x0000,0xBFE3,0xBFE3,0x0000,0x000E,0x000E,0x000E,0x000E,0x000E,0x000E,0x000E,
+    0x0000,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0x0000,0xBFE3,0x0000,0x000E,0x0000,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0x0000,0x000E,
+    0x000E,0x000E,0x000E,0x000E,0x000E,0x0000,0xBFE3,0xBFE3,0xBFE3,0x0560,0xBFE3,0xBFE3,0x0000,0x000E,0x0000,0xBFE3,
+    0xBFE3,0xBFE3,0x0560,0xBFE3,0x000E,0x000E,0x000E,0x000E,0x000E,0x0000,0xBFE3,0x0560,0x0560,0xBFE3,0xBFE3,0x0560,
+    0xBFE3,0xBFE3,0x0000,0xBFE3,0x0560,0x0560,0xBFE3,0xBFE3,0x0560,0x000E,0x000E,0x000E,0x0000,0x0000,0xBFE3,0x0560,
+    0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0x0560,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0x000E,0x000E,
+    0x0000,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,
+    0xBFE3,0xBFE3,0xBFE3,0x000E,0x000E,0x0000,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,
+    0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0x000E,0x0000,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,
+    0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3,0xBFE3
+};
+
+static const u16 SCN_GROUND[64] = {
+    0xE2C2,0xF6B6,0xF6B6,0xF6B6,0x0000,0xE2C2,0xF6B6,0xE2C2,0xF6B6,0xE2C2,0xE2C2,0xE2C2,0x0000,0xF6B6,0xE2C2,0x0000,
+    0xF6B6,0xE2C2,0xE2C2,0xE2C2,0x0000,0xE2C2,0x0000,0xE2C2,0x0000,0xE2C2,0xE2C2,0xE2C2,0x0000,0xF6B6,0xF6B6,0x0000,
+    0xF6B6,0x0000,0x0000,0xE2C2,0x0000,0xF6B6,0xE2C2,0x0000,0xF6B6,0xF6B6,0xF6B6,0x0000,0xF6B6,0xE2C2,0xE2C2,0x0000,
+    0xF6B6,0xE2C2,0xE2C2,0xF6B6,0xE2C2,0xE2C2,0xE2C2,0x0000,0xE2C2,0x0000,0x0000,0xF6B6,0x0000,0x0000,0x0000,0xE2C2
+};
+
+// HILL 从 mariobros-clock-main 精确复制（原始格式：440个元素，按注释每16个分行）
+static const u16 SCN_HILL[440] = {
+0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E,
+0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E,
+0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E,
+0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E,
+0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E,
+0x0000, 0x0000, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E,
+0x000E, 0x000E, 0x000E, 0x000E, 0x0560, 0x0560, 0x0000, 0x0000, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E,
+0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x0560, 0x0560, 0x0560, 0x0560, 0x0000, 0x000E, 0x000E, 0x000E,
+0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x0560, 0x0560, 0x0000, 0x0560,
+0x0560, 0x0000, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E,
+0x0560, 0x0560, 0x0000, 0x0560, 0x0560, 0x0560, 0x0000, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E,
+0x000E, 0x000E, 0x000E, 0x000E, 0x0000, 0x0560, 0x0000, 0x0560, 0x0560, 0x0560, 0x0560, 0x0000, 0x000E, 0x000E, 0x000E, 0x000E,
+0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x0000, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560,
+0x0000, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x0560, 0x0560, 0x0560, 0x0560,
+0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0000, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E,
+0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0000, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E,
+0x000E, 0x000E, 0x000E, 0x000E, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0000,
+0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560,
+0x0560, 0x0560, 0x0560, 0x0560, 0x0000, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x0560, 0x0560, 0x0560, 0x0560,
+0x0560, 0x0560, 0x0000, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0000, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E, 0x000E,
+0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0000, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0000, 0x000E,
+0x000E, 0x000E, 0x000E, 0x000E, 0x0560, 0x0560, 0x0560, 0x0560, 0x0000, 0x0560, 0x0000, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560,
+0x0560, 0x0560, 0x0560, 0x0000, 0x000E, 0x000E, 0x000E, 0x000E, 0x0560, 0x0560, 0x0560, 0x0560, 0x0000, 0x0560, 0x0560, 0x0560,
+0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0000, 0x000E, 0x000E, 0x000E, 0x0560, 0x0560, 0x0560, 0x0560,
+0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0000, 0x000E, 0x000E,
+0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560,
+0x0560, 0x0560, 0x0000, 0x000E, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560,
+0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560, 0x0560
+};
+
+#define SCN_CLOUD_W 13
+#define SCN_CLOUD_H 12
+#define SCN_BUSH_W 21
+#define SCN_BUSH_H 9
+#define SCN_GROUND_W 8
+#define SCN_GROUND_H 8
+// 修正小山尺寸以匹配 mariobros-clock-main 实际数据（行优先存储）
+#define SCN_HILL_W 20
+#define SCN_HILL_H 22
+
+static void draw_scene_mariobros(void) {
+    // 天空底色改为半透明蓝色
+    Color semi_blue = {3, 6, 12, 8}; // 半透明蓝色（alpha=8，约50%透明度）
+    fillScreenSolid(semi_blue);
+
+    // 地面平铺（稍微下移）
+    s32 tile_scale = 6; // 地面砖块扩大2倍（原3→6）
+    s32 ground_offset = 60; // 砖块上移量减少（从80→60，相当于下移20）
+    s32 ground_y = (s32)CFG_FramebufferHeight - (SCN_GROUND_H * tile_scale) - ground_offset;
+    for (s32 x = 0; x < (s32)CFG_FramebufferWidth; x += SCN_GROUND_W * tile_scale) {
+        draw_rgb565_bitmap(x, ground_y, SCN_GROUND, SCN_GROUND_W, SCN_GROUND_H, tile_scale);
+    }
+
+    // 小山与灌木（放大并纵向拉伸）
+    s32 hill_scale_x = 6; // 小山横向6倍
+    s32 hill_scale_y = 8; // 小山纵向8倍（拉伸）
+    s32 hill_left = -10; // 小山左移
+    s32 hill_top = ground_y - (SCN_HILL_H * hill_scale_y);
+    if (hill_top < 0) hill_top = 0; // 防止越界到可视区域之外
+    draw_rgb565_bitmap_scaled(hill_left, hill_top, SCN_HILL, SCN_HILL_W, SCN_HILL_H, hill_scale_x, hill_scale_y);
+
+    s32 bush_scale_x = 6; // 灌木横向6倍
+    s32 bush_scale_y = 8; // 灌木纵向8倍（拉伸）
+    s32 bush_left = (s32)CFG_FramebufferWidth - (SCN_BUSH_W * bush_scale_x) + 10; // 灌木右移
+    s32 bush_top = ground_y - (SCN_BUSH_H * bush_scale_y) + 2;
+    draw_rgb565_bitmap_scaled(bush_left, bush_top, SCN_BUSH, SCN_BUSH_W, SCN_BUSH_H, bush_scale_x, bush_scale_y);
+
+    // 云朵（放大并下移）
+    s32 cloud_scale = 6; // 云朵扩大到6倍（从5→6）
+    s32 cloud_down = 70; // 云朵整体下移更多（从60→70）
+    s32 cloud_h = SCN_CLOUD_H * cloud_scale;
+    s32 cloud_max_top = ground_y - cloud_h - 10; if (cloud_max_top < 0) cloud_max_top = 0;
+    s32 c1_top = 30 + cloud_down; if (c1_top > cloud_max_top) c1_top = cloud_max_top;
+    s32 c2_top = 50 + cloud_down; if (c2_top > cloud_max_top) c2_top = cloud_max_top;
+    s32 c3_top = 40 + cloud_down; if (c3_top > cloud_max_top) c3_top = cloud_max_top;
+    draw_rgb565_bitmap(30, c1_top, SCN_CLOUD1, SCN_CLOUD_W, SCN_CLOUD_H, cloud_scale);
+    draw_rgb565_bitmap(180, c2_top, SCN_CLOUD2, SCN_CLOUD_W, SCN_CLOUD_H, cloud_scale);
+    draw_rgb565_bitmap((s32)CFG_FramebufferWidth - 30 - SCN_CLOUD_W*cloud_scale, c3_top, SCN_CLOUD1, SCN_CLOUD_W, SCN_CLOUD_H, cloud_scale);
 }
 
 // 绘制马里奥（居中，可选状态）
@@ -777,8 +1006,9 @@ static void draw_mario_bitmap(s32 cx, s32 cy, s32 scale, bool jumping) {
     }
 }
 
-static void draw_cloud(s32 left, s32 top, s32 scale);
-static void draw_background_box(s32 left, s32 top, s32 right, s32 bottom);
+// 移除未使用的声明以消除编译警告
+// static void draw_cloud(s32 left, s32 top, s32 scale);
+// static void draw_background_box(s32 left, s32 top, s32 right, s32 bottom);
 int main(int argc, char *argv[])
 {
     log_info("后台程序启动（移植 tesla 绘制逻辑）");
@@ -789,47 +1019,17 @@ int main(int argc, char *argv[])
         log_info("开始首帧绘制：framebufferBegin...");
         // 示例：绘制一次半透明面板与边框
         startFrame();
-		// 背景缩小：仅覆盖主体区域（马里奥+文字+云朵）
-		{
-			const s32 mario_scale = 5;
-        s32 cx = (s32)(CFG_FramebufferWidth * 0.5f);
-        s32 cy = (s32)(CFG_FramebufferHeight * 0.5f);
-			s32 mario_top = cy - (MARIO_IDLE_H*mario_scale)/2;
-			s32 mario_bottom = cy + (MARIO_IDLE_H*mario_scale)/2;
-			s32 text_top = mario_bottom + 12;
-			s32 box_top = mario_top - 80;       // 再增加留白
-			s32 box_bottom = text_top + 90;     // 再增加留白
-			s32 box_left = cx - 260;
-			s32 box_right = cx + 260;
-			draw_background_box(box_left, box_top, box_right, box_bottom);
-		}
-		// 使用优化后的马里奥点阵图（静止状态），放大到 scale=5
-		s32 cx = (s32)(CFG_FramebufferWidth * 0.5f);
-		s32 cy = (s32)(CFG_FramebufferHeight * 0.5f);
-		const s32 mario_scale = 5;
-		const s32 brick_scale = 5;
-		const s32 jump_delta = 30; // 跳跃高度（像素）
-		draw_mario_bitmap(cx, cy, mario_scale, false);
-		// 砖块：与马里奥跳跃顶点的头顶相平（砖块底边 = 头顶）
-		{
-			s32 left_x = cx - (16*brick_scale)/2;
-			s32 mario_top_apex = (cy - jump_delta) - (MARIO_JUMP_H * mario_scale) / 2; // 跳跃顶点时头顶y
-			s32 brick_top = mario_top_apex - 16*brick_scale; // 让砖块底边与头顶对齐
-			draw_cloud(left_x, brick_top, brick_scale);
-		}
-        // 在马里奥下面显示首帧短语
-        {
-            const char *texts[] = {"正在备份", "正在上传", "备份成功", "备份失败", "上传成功", "上传失败"};
-            size_t idx = 0;
-            const char *t = texts[idx];
-            s32 text_scale = 4;
-            s32 letter_spacing = 1;
-			s32 mario_bottom = cy + (MARIO_IDLE_H*5)/2;
-            s32 text_top = mario_bottom + 12;
-            s32 text_width = text_bitmap_width(t, text_scale, letter_spacing);
-            s32 text_left = cx - text_width/2;
-			draw_text_bold_outline(t, text_left, text_top, text_scale, letter_spacing);
-        }
+        // 绘制 mariobros 风格场景
+        draw_scene_mariobros();
+        // 初始马里奥位置与比例
+        s32 mario_scale = 5;
+        s32 tile_scale = 3;
+        s32 ground_y = (s32)CFG_FramebufferHeight - (SCN_GROUND_H * tile_scale);
+        // 从左侧入场
+        s32 mario_x0 = 30;
+        s32 mario_bottom0 = ground_y;
+        s32 mario_top0 = mario_bottom0 - (MARIO_IDLE_H * mario_scale);
+        draw_mario_bitmap(mario_x0, mario_top0 + (MARIO_IDLE_H * mario_scale)/2, mario_scale, false);
         log_info("提交首帧：framebufferEnd...");
         endFrame();
 
@@ -842,55 +1042,57 @@ int main(int argc, char *argv[])
     u32 frame_index = 0;
     while (true) {
         startFrame();
-		// 背景缩小：仅覆盖主体区域
-		{
-			const s32 mario_scale = 5;
-        s32 cx = (s32)(CFG_FramebufferWidth * 0.5f);
-        s32 baseCy = (s32)(CFG_FramebufferHeight * 0.5f);
-			s32 mario_top = (baseCy) - (MARIO_IDLE_H*mario_scale)/2 - 30; // 取跳跃顶点稍高
-			s32 mario_bottom = (baseCy) + (MARIO_IDLE_H*mario_scale)/2;
-			s32 text_top = mario_bottom + 12;
-			s32 box_top = mario_top - 80;
-			s32 box_bottom = text_top + 90;
-			s32 box_left = cx - 260;
-			s32 box_right = cx + 260;
-			draw_background_box(box_left, box_top, box_right, box_bottom);
-		}
-		s32 cx = (s32)(CFG_FramebufferWidth * 0.5f);
-		s32 baseCy = (s32)(CFG_FramebufferHeight * 0.5f);
-		const s32 mario_scale = 5;
-		const s32 brick_scale = 5;
-		const s32 jump_delta = 30;
-		
-		bool is_jumping = (frame_index & 1) != 0; // 偶数静止，奇数跳跃顶点
-		s32 cy2 = is_jumping ? (baseCy - jump_delta) : baseCy;
-		draw_mario_bitmap(cx, cy2, mario_scale, is_jumping);
-		
-		// 砖块固定位置：与跳跃顶点头顶相平
-		{
-			s32 left_x = cx - (16*brick_scale)/2;
-			s32 mario_top_apex = (baseCy - jump_delta) - (MARIO_JUMP_H * mario_scale) / 2;
-			s32 brick_top = mario_top_apex - 16*brick_scale;
-			draw_cloud(left_x, brick_top, brick_scale);
-		}
-        
-        // 循环显示文字提示
-        {
-            const char *texts[] = {"正在备份", "正在上传", "备份成功", "备份失败", "上传成功", "上传失败"};
-            const size_t texts_count = sizeof(texts)/sizeof(texts[0]);
-            size_t idx = (frame_index / 16) % texts_count; // 每16帧切换一次文字
-            const char *t = texts[idx];
-            s32 text_scale = 4;
-            s32 letter_spacing = 1;
-			s32 mario_bottom = baseCy + (MARIO_IDLE_H*5)/2;
-            s32 text_top = mario_bottom + 12;
-            s32 text_width = text_bitmap_width(t, text_scale, letter_spacing);
-            s32 text_left = cx - text_width/2;
-			draw_text_bold_outline(t, text_left, text_top, text_scale, letter_spacing);
+        // 完整场景：mariobros 风格 + 马里奥动作（行走+周期跳跃）
+        draw_scene_mariobros();
+        static s32 mario_scale = 5;
+        static s32 tile_scale = 3;
+        static s32 ground_y = 0;
+        if (ground_y == 0) ground_y = (s32)CFG_FramebufferHeight - (SCN_GROUND_H * tile_scale) - 60; // 同步砖块上移
+        static s32 mario_x = 30;
+        static s32 mario_bottom = 0;
+        static s32 vy = 0;
+        static bool jumping = false;
+        if (mario_bottom == 0) mario_bottom = ground_y;
+        // 增加弹跳频率：每30帧起跳一次
+        if (!jumping && (frame_index % 30 == 0)) {
+            jumping = true;
+            vy = -20; // 初速度再增
         }
+        // 恢复水平平移
+        mario_x += 4; // 再快一些的行走速度
+        if (mario_x > (s32)CFG_FramebufferWidth + 40) mario_x = -40;
+        // 垂直物理（重力）
+        if (jumping) {
+            mario_bottom += vy;
+            vy += 2; // 重力
+            if (mario_bottom >= ground_y) {
+                mario_bottom = ground_y;
+                vy = 0;
+                jumping = false;
+            }
+        }
+        // 计算绘制用中心Y（把 bottom 转为中心），整体上移 50 像素
+        s32 sprite_h = jumping ? MARIO_JUMP_H : MARIO_IDLE_H;
+        s32 cy2 = mario_bottom - (sprite_h * mario_scale)/2 - 50;
+        draw_mario_bitmap(mario_x, cy2 + (sprite_h * mario_scale)/2, mario_scale, jumping);
+        
+        // 在窗口上半部分显示"正在备份"（居中，纵向拉伸，上移）
+        {
+            const char *text = "正在备份";
+            s32 text_scale_x = 5; // 横向5倍
+            s32 text_scale_y = 7; // 纵向7倍（拉伸）
+            s32 letter_spacing = 1;
+            s32 text_height = GLYPH_H * text_scale_y;
+            // 上移：减少基准高度，下移1.5倍文字高度
+            s32 text_top = (s32)(CFG_FramebufferHeight * 0.15f) + text_height + text_height/2; // 下移1.5倍
+            s32 text_width = text_bitmap_width(text, text_scale_x, letter_spacing);
+            s32 text_left = ((s32)CFG_FramebufferWidth - text_width) / 2;
+            draw_text_bold_outline_scaled(text, text_left, text_top, text_scale_x, text_scale_y, letter_spacing);
+        }
+        
         endFrame();
         frame_index++;
-		svcSleepThread(150000000ULL); // 150ms per frame ≈ 6.7fps（稍慢）
+        svcSleepThread(60000000ULL); // 60ms per frame ≈ 16.7 fps（更快）
     }
 
     gfx_exit();
@@ -898,7 +1100,8 @@ int main(int argc, char *argv[])
 }
 
 // 砖块绘制（16x16像素，带边框和纹理）
-static void draw_cloud(s32 left, s32 top, s32 scale) {
+// 静态工具未被使用：保留实现但加 unused 标注，避免警告
+static __attribute__((unused)) void draw_cloud(s32 left, s32 top, s32 scale) {
     if (!g_currentFramebuffer) return;
     // 16x12 简易云朵
     Color white = (Color){15,15,15,15};
@@ -912,7 +1115,7 @@ static void draw_cloud(s32 left, s32 top, s32 scale) {
     drawRect(left + 2*scale,  top + 8*scale, 12*scale, 1*scale, light);
 }
 
-static void draw_background_box(s32 left, s32 top, s32 right, s32 bottom) {
+static __attribute__((unused)) void draw_background_box(s32 left, s32 top, s32 right, s32 bottom) {
     if (!g_currentFramebuffer) return;
     if (left > right) { s32 t = left; left = right; right = t; }
     if (top > bottom) { s32 t = top; top = bottom; bottom = t; }
@@ -922,10 +1125,55 @@ static void draw_background_box(s32 left, s32 top, s32 right, s32 bottom) {
     if (right > (s32)CFG_FramebufferWidth) right = CFG_FramebufferWidth;
     if (bottom > (s32)CFG_FramebufferHeight) bottom = CFG_FramebufferHeight;
 
-    Color sky  = (Color){2, 6, 15, 15};   // 天空蓝
-    Color land = (Color){1, 8, 1, 15};    // 草地绿
-    // 天空区域
-    drawRect(left, top, right - left, bottom - top - 20, sky);
-    // 细小地面条（背景盒子内部底部20像素）
-    drawRect(left, bottom - 20, right - left, 20, land);
+    // 草地配色（包裹内容，无天空）
+    Color grass_dark  = (Color){0, 6, 0, 15};   // 深绿草地阴影
+    Color grass_base  = (Color){1, 8, 1, 15};   // 基础草地绿
+    Color grass_light = (Color){2, 10, 2, 15};  // 亮绿草地高光
+    Color dirt        = (Color){5, 3, 1, 15};   // 泥土色
+    
+    s32 width = right - left;
+    s32 height = bottom - top;
+    // 草地高度改为盒子高度的 1/3，仅在底部绘制草地条带
+    s32 grass_h_total = height / 3;
+    if (grass_h_total < 24) grass_h_total = 24; // 保证最小高度，避免细节被裁剪
+    s32 grass_top = bottom - grass_h_total;
+
+    // 草地主体（使用实心绘制，避免历史残影）
+    drawRectSolid(left, grass_top, width, grass_h_total, grass_base);
+    // 草地顶部深色边界线
+    drawRectSolid(left, grass_top, width, 2, grass_dark);
+    // 侧边微暗（轻微包边，避免突兀）
+    drawRectSolid(left, grass_top, 1, grass_h_total, grass_dark);
+    drawRectSolid(right - 1, grass_top, 1, grass_h_total, grass_dark);
+
+    // 底部泥土层（草地下方露出泥土，包裹字体）
+    s32 dirt_height = grass_h_total / 3;
+    if (dirt_height < 8) dirt_height = 8;
+    drawRectSolid(left, bottom - dirt_height, width, dirt_height, dirt);
+    // 泥土与草地交界处的深色线
+    drawRectSolid(left, bottom - dirt_height, width, 1, grass_dark);
+
+    // 添加草丛细节（垂直小条纹模拟草叶）
+    for (s32 i = 4; i < width - 4; i += 6) {
+        s32 x = left + i;
+        s32 base_y = grass_top + 4;
+        s32 blade_h = 3 + (i % 3);
+        drawRect(x, base_y, 1, blade_h, grass_light);
+        drawRect(x + 2, base_y + 1, 1, blade_h - 1, grass_light);
+    }
+
+    // 泥土细节：小石子和纹理
+    for (s32 i = 5; i < width - 5; i += 12) {
+        s32 x = left + i;
+        s32 y = bottom - dirt_height + 3;
+        drawRect(x, y, 2, 2, grass_dark);
+        drawRect(x + 6, y + 4, 1, 1, grass_dark);
+    }
+
+    // 草地带中的随机深色斑点（增加真实感）
+    for (s32 i = 8; i < width - 8; i += 20) {
+        s32 x = left + i;
+        s32 y = grass_top + (grass_h_total / 2) + ((i / 4) % 5) - 2;
+        drawRect(x, y, 2, 1, grass_dark);
+    }
 }
